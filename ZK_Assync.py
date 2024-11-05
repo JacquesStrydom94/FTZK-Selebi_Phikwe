@@ -6,8 +6,8 @@ import json
 import os
 from queue import Queue
 import time
-import re  # Import the re module for regular expressions
-from attlog_parser import AttLogParser  # Import the AttLogParser class
+import re
+from attlog_parser import AttLogParser
 
 # Configure logging with ANSI escape codes for colors
 class CustomFormatter(logging.Formatter):
@@ -40,14 +40,13 @@ class CustomFormatter(logging.Formatter):
 
 handler = logging.StreamHandler()
 handler.setFormatter(CustomFormatter())
-logging.basicConfig(level=logging.DEBUG, handlers=[handler])  # Set logging level to DEBUG
+logging.basicConfig(level=logging.DEBUG, handlers=[handler])
 
 # cSpell:ignore levelname ZKID atttime ATTSTATE verifymode clockid ATTLOG attlog
 
 def extract_attlog(data):
-    # Extract the string after Content-Length: 44
     content_length_index = data.find("Content-Length:")
-    if (content_length_index == -1):
+    if content_length_index == -1:
         return None
 
     content_length_start = content_length_index + len("Content-Length:")
@@ -60,7 +59,6 @@ def extract_attlog(data):
     return attlog_data
 
 def extract_sn(data_str):
-    # Extract the SN value using regex
     sn_match = re.search(r'SN=([^&]+)', data_str)
     if sn_match:
         return sn_match.group(1)
@@ -72,10 +70,10 @@ def write_to_file(queue, filename):
         json_packet = queue.get()
         if json_packet is None:
             break
-        logging.debug(f"Writing to file: {json_packet}")  # Debug log statement
+        logging.debug(f"Writing to file: {json_packet}")
         if not os.path.exists(filename):
             with open(filename, 'w') as f:
-                json.dump([], f)  # Create an empty JSON array
+                json.dump([], f)
         with open(filename, 'r+') as f:
             data = json.load(f)
             data.append(json_packet)
@@ -83,56 +81,61 @@ def write_to_file(queue, filename):
             json.dump(data, f, indent=2)
         queue.task_done()
 
-#receive data and queue the writing there of
 def handle_device(host, port, device_ip, queue):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind((host, port))
         s.listen()
-        logging.info(f"\033[92mServer listening on {host}:{port}\033[0m")
+        s.settimeout(10)  # Set socket timeout for faster handling
+        logging.info(f"Server listening on {host}:{port}")
         while True:
-            conn, addr = s.accept()
-            with conn:
-                logging.info(f"\033[92mConnected by {addr} (expected {device_ip})\033[0m")
-                try:
+            try:
+                conn, addr = s.accept()
+                with conn:
+                    logging.info(f"Connected by {addr} (expected {device_ip})")
+                    conn.settimeout(10)
                     while True:
-                        data = conn.recv(4096)
-                        if not data:
+                        try:
+                            data = conn.recv(4096)
+                            if not data:
+                                break
+                            try:
+                                data_str = data.decode('utf-8')
+                            except UnicodeDecodeError:
+                                data_str = data.decode('utf-8', errors='ignore')
+                                logging.warning("Invalid byte sequence encountered. Proceeding with ignored errors.")
+                            
+                            logging.debug(f"Received from client: {data_str}")
+
+                            if "=ATTLOG&Stamp=9999" in data_str:
+                                attlog_data = extract_attlog(data_str)
+                                sn_value = extract_sn(data_str)
+                                if attlog_data and sn_value:
+                                    combined_value = f"{attlog_data}\t{addr}\t{sn_value}"
+                                    json_packet = {
+                                        "attlog": combined_value
+                                    }
+                                    logging.info(f"Parsed JSON packet: {json.dumps(json_packet, indent=2)}")
+                                    logging.debug(f"Adding to queue: {json_packet}")
+                                    queue.put(json_packet)
+
+                            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S:%f')[:-3]
+                            response = f"Server Send Data: {timestamp}\nOK"
+                            conn.sendall(response.encode())
+                        except socket.timeout:
+                            logging.info(f"Connection timeout with {addr}")
                             break
-                        data_str = data.decode()
-                        # Highlight received data in yellow
-                        logging.debug(f"Received from client: {data_str}")
-
-                        if "=ATTLOG&Stamp=9999" in data_str:
-                            attlog_data = extract_attlog(data_str)
-                            sn_value = extract_sn(data_str)
-                            if attlog_data and sn_value:
-                                combined_value = f"{attlog_data}\t{addr}\t{sn_value}"
-                                json_packet = {
-                                    "attlog": combined_value
-                                }
-                                logging.info(f"\033[94mParsed JSON packet:\033[0m {json.dumps(json_packet, indent=2)}")
-                                logging.debug(f"Adding to queue: {json_packet}")
-                                queue.put(json_packet)
-
-                        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S:%f')[:-3]
-                        response = f"Server Send Data: {timestamp}\nOK"
-                        conn.sendall(response.encode())
-                except Exception as e:
-                    logging.error(f"An error occurred: {e}")
-                finally:
-                    logging.info(f"\033[91mClosing connection to {addr}\033[0m")
+            except socket.timeout:
+                logging.info("Listening socket timeout")
 
 def start_server(host, devices, filename):
     queue = Queue()
     
-    # Start the writer thread for writing to attlog.json
     writer_thread = threading.Thread(target=write_to_file, args=(queue, filename))
     writer_thread.start()
-    logging.debug("Writer thread started")  # Debug log statement
+    logging.debug("Writer thread started")
     
     threads = []
     
-        # Start the device handler threads for each device
     for device in devices:
         thread = threading.Thread(target=handle_device, args=(host, device['port'], device['ip'], queue))
         threads.append(thread)
@@ -141,7 +144,7 @@ def start_server(host, devices, filename):
     for thread in threads:
         thread.join()
     
-    queue.put(None)  # Signal the writer thread to exit
+    queue.put(None)
     writer_thread.join()
 
 if __name__ == "__main__":
@@ -158,8 +161,6 @@ if __name__ == "__main__":
         {"ip": "127.0.0.1", "port": 5009},
         {"ip": "127.0.0.1", "port": 5010}
     ]
-    
-    # Ensure the JSON files exist before starting the server
     attlog_filename = "attlog.json"
     sanatise_filename = "sanatise.json"
     
@@ -171,7 +172,6 @@ if __name__ == "__main__":
         with open(sanatise_filename, 'w') as f:
             json.dump([], f)
 
-    # Start the AttLogParser thread for reading from attlog.json and writing to sanatise.json
     parser_thread = threading.Thread(target=AttLogParser().run)
     parser_thread.start()
 
